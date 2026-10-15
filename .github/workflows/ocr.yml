@@ -1,0 +1,306 @@
+name: Kitab OCR
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: "Gemini মডেলের নাম"
+        required: true
+        default: "gemini-2.5-pro"
+        type: string
+      book_folder:
+        description: "pages/ এর ভেতরের কিতাব-ফোল্ডারের নাম (ফাঁকা রাখলে সব কিতাব)"
+        required: false
+        default: ""
+        type: string
+      delay_seconds:
+        description: "প্রতি পৃষ্ঠার পর অপেক্ষার সময় (রেট লিমিট এড়াতে)"
+        required: true
+        default: "5"
+        type: string
+      max_pages:
+        description: "এই রানে সর্বোচ্চ কতটা পৃষ্ঠা (0 = সব)"
+        required: true
+        default: "0"
+        type: string
+      force_redo:
+        description: "আগে করা পৃষ্ঠাও আবার করবে"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: kitab-ocr
+  cancel-in-progress: false
+
+jobs:
+  ocr:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    env:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      GEMINI_MODEL: ${{ inputs.model }}
+      BOOK_FOLDER: ${{ inputs.book_folder }}
+      DELAY_SECONDS: ${{ inputs.delay_seconds }}
+      MAX_PAGES: ${{ inputs.max_pages }}
+      FORCE_REDO: ${{ inputs.force_redo }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install google-genai pillow
+
+      - name: Write master prompt
+        run: |
+          cat > prompt.txt <<'PROMPT_EOF'
+          # UNIVERSAL MASTER PROMPT (v4): Faithful OCR / Retyping of Islamic Book Pages (Bangla + Arabic), Plain Text, Justify-Ready
+
+          ## ROLE
+          You are an expert OCR transcriber and proofreader specializing in Bangla and Arabic Islamic books (kitab). Your job is to retype the text from the attached page image with 100% fidelity and deliver it as clean, plain, editable Unicode text, following every rule below strictly.
+
+          ## TASK
+          Carefully read the attached image and retype ALL of its body content into clean, editable digital text. Do not summarize, translate, paraphrase, explain, correct the author's opinions, or add commentary. Only transcribe.
+
+          ## RULE 1: REMOVE THE FOOTER / HEADER / PAGE ARTIFACTS
+          - Do NOT include the running footer or header that contains the book name, chapter running title, or page number (for example: "Book Name - 54").
+          - Also ignore: watermarks (e.g. "PDF by ..."), scanner marks, page borders, binding shadows, stray dots, specks, and any non-content marks.
+          - Keep the actual chapter/section headings that belong to the body content. Remove only the repeating running header/footer.
+
+          ## RULE 2: ARABIC TEXT MUST BE 100% IDENTICAL (SAME-TO-SAME)
+          - Reproduce every Arabic word exactly as shown in the image.
+          - Preserve ALL harakat and diacritics without omission, including:
+            - Fatha (َ U+064E), Kasra (ِ U+0650), Damma (ُ U+064F)
+            - Tanwin: Fathatan (ً U+064B), Kasratan (ٍ U+064D), Dammatan (ٌ U+064C)
+            - Sukun (ْ U+0652)
+            - Shadda / Tashdid (ّ U+0651), including every shadda + vowel combination
+            - Madd (ٓ U+0653), Dagger alif (ٰ U+0670), Hamzat al-wasl (ٱ), Hamza forms (أ إ ؤ ئ ء)
+            - Small Quranic marks and pause signs (ۚ ۖ ۗ ۛ etc.) if present
+          - Do NOT "normalize", simplify, strip, or auto-correct the Arabic spelling or vowels. Copy what the image shows, mark by mark.
+          - Unicode ordering: write the Shadda immediately after the base letter, and the vowel mark after the Shadda (letter + Shadda + vowel).
+          - If a diacritic is genuinely unclear in the image, still make your best faithful reading and put [?] immediately after that word. Never silently guess or skip.
+          - Keep Arabic as proper right-to-left (RTL) Unicode Arabic characters. Never transliterate Arabic into Bangla or English letters.
+          - Parenthetical Arabic (chapter titles, source references such as "(رواه البخارى)") must also be written in Arabic exactly as shown, including whatever diacritics the image shows or does not show. Do not ADD diacritics to words that have none in the image, and do not REMOVE diacritics from words that have them.
+
+          ## RULE 2A: CRITICAL: THE WORD "ALLAH" (لفظ الجلالة) AND SHADDA PROTECTION
+          This is the most commonly failed rule. Follow it with maximum care:
+          - Every occurrence of the Name of Allah in Arabic script (اللّٰه / اللَّه / الله / اَللّٰهُمَّ / اللّٰهُمَّ etc.) must carry exactly the marks that appear in the image. If the image shows a Shadda on the second lam, it MUST appear in your output. Dropping it is a critical error.
+          - Examples of forms to preserve exactly as the image shows them: اَللّٰهُمَّ، اللّٰهِ، اللّٰهُ، اللّٰهَ، اللَّهِ، اللَّهُ.
+          - Likewise preserve the Shadda on the Meem in اللّٰهُمَّ and on every other doubled letter in every other word (e.g. الثَّالِثَةِ، قَرْنُ الشَّيْطَانِ، الزَّلَازِلُ).
+          - Do NOT replace the diacritized form with the plain form "الله" if the image shows marks on it.
+          - After finishing, re-scan every Arabic word one by one and confirm that no Shadda, Madd, Dagger alif, Tanwin, or Sukun has been lost.
+
+          ## RULE 3: HONORIFICS (SALUTATIONS) MUST BE WRITTEN IN FULL ARABIC
+          If the image shows an honorific in abbreviated, symbolic, or Bangla-transliterated form, replace it with the complete, fully-voweled Arabic form (with all Shadda marks). Apply consistently:
+          - (সাঃ) / (সা.) / (দঃ) / ﷺ / সাল্লাল্লাহু আলাইহি ওয়া সাল্লাম in short form → صَلَّى اللَّهُ عَلَيْهِ وَسَلَّمَ
+          - (রাঃ) / (রা.) for a male Companion → رَضِيَ اللَّهُ عَنْهُ
+          - (রাঃ) for a female Companion → رَضِيَ اللَّهُ عَنْهَا
+          - (রাঃ) for two Companions → رَضِيَ اللَّهُ عَنْهُمَا
+          - (রাঃ) for multiple Companions → رَضِيَ اللَّهُ عَنْهُمْ
+          - (আঃ) / (আ.) for Prophets and angels → عَلَيْهِ السَّلَامُ
+          - (রহঃ) / (রহ.) for male scholars/righteous predecessors → رَحِمَهُ اللَّهُ
+          - (রহঃ) for a female → رَحِمَهَا اللَّهُ
+          - Short forms of "সুবহানাহু ওয়া তায়ালা" → سُبْحَانَهُ وَتَعَالَى
+          - Short forms of "আযযা ওয়া জাল্লা" → عَزَّ وَجَلَّ
+          - Choose the correct gender/number form from context (male / female / dual / plural).
+          - If the honorific is ALREADY written in full in the image (in Arabic or Bangla), do not duplicate it. Convert a fully written Bangla honorific into the matching Arabic form only if it was clearly meant as the honorific.
+          - Place the full Arabic honorific right after the name, exactly where the abbreviation appeared, inline within the Bangla sentence.
+
+          ## RULE 4: BANGLA TEXT
+          - Retype the Bangla text exactly as written, word for word, in standard Unicode Bangla.
+          - Preserve the author's original spelling, including older or unconventional spellings (e.g. "ছাল্লাল্লাহু", "ইছলাম", "মুছলমান", "হাদীছ", "রাছূল"). Do NOT modernize or correct them.
+          - Preserve punctuation exactly: danda (।), commas, quotation marks, parentheses, exclamation marks.
+          - Preserve conjuncts (যুক্তাক্ষর) correctly, e.g. ক্ষ, জ্ঞ, ন্দ, ল্ল, স্ম.
+          - Preserve Bangla digits as they appear (e.g. ৫৮২).
+          - Do not merge, split, or reorder paragraphs.
+          - Keep the heading/title on its own, as one flowing line/paragraph without forced mid-title breaks.
+
+          ## RULE 5: STRUCTURE, ORDER, AND LINE-BREAK HANDLING
+          - Follow the page's exact reading order: top to bottom; Bangla left-to-right, Arabic right-to-left.
+          - Keep the sequence: heading → Bangla paragraph → Arabic passage → Bangla translation → next paragraph, etc.
+          - IMPORTANT: Do NOT copy the physical line breaks of the printed page. The image breaks lines only because of page width. Join the lines of each paragraph into ONE continuous paragraph with normal single spaces, and insert a paragraph break only where the image shows a real paragraph break (new indented paragraph, new section, or a switch between Bangla and an Arabic passage). This is what makes the text look even and justify properly when the user applies Justify in Word or Google Docs.
+          - Keep each Arabic passage as ONE continuous paragraph (not line by line), separated from the Bangla text by a blank line.
+          - Fix word splits caused only by line wrapping, but never alter the spelling itself.
+          - If a paragraph is cut off at the bottom of the page, keep it cut off exactly there. Do not complete it.
+          - If a real footnote (not the running footer) exists, include it at the end, clearly marked as a footnote.
+
+          ## RULE 6: ACCURACY AND SELF-CHECK
+          Before giving the final output, silently verify:
+          1. Every Bangla word matches the image (spelling preserved as the author wrote it).
+          2. Every Arabic word and every diacritic matches the image, especially the Shadda on الله / اَللّٰهُمَّ and all other Shadda, Madd, Dagger alif, Tanwin, and Sukun marks.
+          3. Footer / page number / book name / watermark has been removed.
+          4. Abbreviated honorifics have been expanded to the correct full, fully-voweled Arabic form.
+          5. Lines of each paragraph have been merged into continuous paragraphs with no leftover printed-line breaks.
+          6. Nothing was added, translated, summarized, or skipped.
+
+          ## OUTPUT FORMAT
+          - Output ONLY the retyped text as plain Unicode text. No HTML, no code, no markdown styling (no bold, bullets, or # headers), no introduction, no explanation, no notes, no "Here is the text".
+          - Separate paragraphs with a single blank line.
+          - Use [?] only where a character or diacritic is genuinely unreadable.
+          - After the text, add nothing else.
+
+          Begin transcription of the attached image now.
+          PROMPT_EOF
+
+      - name: Write OCR script
+        run: |
+          cat > ocr.py <<'PY_EOF'
+          import os
+          import sys
+          import time
+          from pathlib import Path
+
+          from google import genai
+          from google.genai import types
+          from PIL import Image
+
+          API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+          if not API_KEY:
+              sys.exit("GEMINI_API_KEY সিক্রেট পাওয়া যায়নি। Settings > Secrets and variables > Actions এ যোগ করুন।")
+
+          MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-pro").strip() or "gemini-2.5-pro"
+          BOOK_FILTER = os.environ.get("BOOK_FOLDER", "").strip()
+          DELAY = float(os.environ.get("DELAY_SECONDS", "5") or 5)
+          MAX_PAGES = int(os.environ.get("MAX_PAGES", "0") or 0)
+          FORCE = os.environ.get("FORCE_REDO", "false").lower() == "true"
+
+          client = genai.Client(api_key=API_KEY)
+          prompt = Path("prompt.txt").read_text(encoding="utf-8")
+          config = types.GenerateContentConfig(temperature=0)
+
+          EXTS = {".jpg", ".jpeg", ".png", ".webp"}
+          pages_root = Path("pages")
+          out_root = Path("output")
+          out_root.mkdir(exist_ok=True)
+
+          if not pages_root.exists():
+              sys.exit("pages/ ফোল্ডার নেই। কিতাবের ছবি pages/ এর ভেতরে আপলোড করুন।")
+
+
+          def list_images(folder):
+              return sorted(p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in EXTS)
+
+
+          # কিতাব খোঁজা: pages/ এর সরাসরি ছবি = "kitab", আর প্রতিটা সাবফোল্ডার = আলাদা কিতাব
+          books = {}
+          direct = list_images(pages_root)
+          if direct:
+              books["kitab"] = direct
+          for sub in sorted(p for p in pages_root.iterdir() if p.is_dir()):
+              imgs = list_images(sub)
+              if imgs:
+                  books[sub.name] = imgs
+
+          if BOOK_FILTER:
+              books = {k: v for k, v in books.items() if k == BOOK_FILTER}
+
+          if not books:
+              sys.exit("কোনো ছবি পাওয়া যায়নি (ফোল্ডারের নাম বা ছবির ফরম্যাট দেখুন)।")
+
+          print(f"মডেল: {MODEL} | কিতাব: {list(books.keys())} | delay: {DELAY}s | max_pages: {MAX_PAGES or 'সব'} | force: {FORCE}")
+
+          processed = 0
+          failed_all = []
+          stopped_by_limit = False
+
+          for book, images in books.items():
+              parts_dir = out_root / "parts" / book
+              parts_dir.mkdir(parents=True, exist_ok=True)
+
+              for img_path in images:
+                  part_file = parts_dir / (img_path.stem + ".txt")
+
+                  if part_file.exists() and not FORCE:
+                      print(f"skip (আগেই হয়েছে): {book}/{img_path.name}")
+                      continue
+
+                  if MAX_PAGES and processed >= MAX_PAGES:
+                      stopped_by_limit = True
+                      break
+
+                  text = None
+                  try:
+                      img = Image.open(img_path)
+                      img.load()
+                  except Exception as e:
+                      print(f"ছবি খোলা যায়নি {img_path.name}: {e}")
+                      failed_all.append(f"{book}/{img_path.name}")
+                      continue
+
+                  for attempt in range(4):
+                      try:
+                          resp = client.models.generate_content(
+                              model=MODEL,
+                              contents=[prompt, img],
+                              config=config,
+                          )
+                          t = (resp.text or "").strip()
+                          if not t:
+                              raise RuntimeError("খালি উত্তর এসেছে (সম্ভবত সেফটি ফিল্টার বা সাময়িক ত্রুটি)")
+                          text = t
+                          break
+                      except Exception as e:
+                          wait = 20 * (attempt + 1)
+                          print(f"ত্রুটি ({book}/{img_path.name}) চেষ্টা {attempt + 1}/4: {e} | {wait}s পর আবার")
+                          time.sleep(wait)
+
+                  if text is None:
+                      print(f"ব্যর্থ: {book}/{img_path.name}")
+                      failed_all.append(f"{book}/{img_path.name}")
+                      continue
+
+                  part_file.write_text(text, encoding="utf-8")
+                  processed += 1
+                  print(f"সম্পন্ন: {book}/{img_path.name}")
+                  time.sleep(DELAY)
+
+              # এই কিতাবের সব পার্ট জোড়া লাগানো
+              parts = sorted(parts_dir.glob("*.txt"))
+              if parts:
+                  combined = "\n\n".join(p.read_text(encoding="utf-8") for p in parts)
+                  (out_root / f"{book}.txt").write_text(combined, encoding="utf-8")
+                  print(f"output/{book}.txt তৈরি হয়েছে ({len(parts)} পৃষ্ঠা)")
+
+              if stopped_by_limit:
+                  break
+
+          if failed_all:
+              (out_root / "failed_pages.txt").write_text("\n".join(failed_all), encoding="utf-8")
+              print("ব্যর্থ পৃষ্ঠার তালিকা: output/failed_pages.txt")
+          elif (out_root / "failed_pages.txt").exists():
+              (out_root / "failed_pages.txt").unlink()
+
+          if stopped_by_limit:
+              print("max_pages সীমায় পৌঁছে থেমেছে। আবার Run করলে বাকি পৃষ্ঠা থেকে শুরু হবে।")
+          print("শেষ।")
+          PY_EOF
+
+      - name: Run OCR
+        run: python ocr.py
+
+      - name: Upload output as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kitab-output
+          path: output/
+          if-no-files-found: ignore
+
+      - name: Commit output to repository
+        if: always()
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add output
+          git commit -m "OCR output" || echo "nothing to commit"
+          git pull --rebase || true
+          git push || echo "push skipped"
