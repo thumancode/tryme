@@ -1,9 +1,5 @@
 kitab/0020.jpg
-kitab/0021.jpg
-kitab/0022.jpg
-kitab/0023.jpg
 kitab/0024.jpg
-kitab/0025.jpg
 kitab/0026.jpg
 kitab/0027.jpg
 kitab/0028.jpg
