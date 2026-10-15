@@ -3,6 +3,11 @@ name: Kitab OCR
 on:
   workflow_dispatch:
     inputs:
+      api_key:
+        description: "Gemini API key (ফাঁকা রাখলে GEMINI_API_KEY সিক্রেট ব্যবহার হবে)"
+        required: false
+        default: ""
+        type: string
       model:
         description: "Gemini মডেলের নাম"
         required: true
@@ -41,7 +46,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 340
     env:
-      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      INPUT_API_KEY: ${{ inputs.api_key }}
+      SECRET_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       GEMINI_MODEL: ${{ inputs.model }}
       BOOK_FOLDER: ${{ inputs.book_folder }}
       DELAY_SECONDS: ${{ inputs.delay_seconds }}
@@ -56,6 +62,22 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: Resolve API key
+        run: |
+          if [ -n "$INPUT_API_KEY" ]; then
+            KEY="$INPUT_API_KEY"
+            echo "::add-mask::$KEY"
+            echo "API key: ইনপুট থেকে নেওয়া হয়েছে"
+          elif [ -n "$SECRET_API_KEY" ]; then
+            KEY="$SECRET_API_KEY"
+            echo "API key: সিক্রেট থেকে নেওয়া হয়েছে"
+          else
+            echo "কোনো API key পাওয়া যায়নি। ইনপুটে দিন অথবা GEMINI_API_KEY সিক্রেট যোগ করুন।"
+            exit 1
+          fi
+          echo "::add-mask::$KEY"
+          echo "GEMINI_API_KEY=$KEY" >> "$GITHUB_ENV"
 
       - name: Install dependencies
         run: pip install google-genai pillow
@@ -165,7 +187,7 @@ jobs:
 
           API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
           if not API_KEY:
-              sys.exit("GEMINI_API_KEY সিক্রেট পাওয়া যায়নি। Settings > Secrets and variables > Actions এ যোগ করুন।")
+              sys.exit("GEMINI_API_KEY পাওয়া যায়নি।")
 
           MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-pro").strip() or "gemini-2.5-pro"
           BOOK_FILTER = os.environ.get("BOOK_FOLDER", "").strip()
